@@ -5569,6 +5569,8 @@
         let ttsIsPanelOpen = false;
         let ttsIsAudioFocusMode = false;
         let ttsCurrentChunkText = "";
+        let ttsWatchdogTimer = null; // Watchdog para detectar Chrome TTS hang
+        let ttsCurrentPageId = 0; // ID único por operación de página para evitar race conditions
 
         // === VARIABLES PARA AUDIO EN SEGUNDO PLANO ===
         let audioContext = null;
@@ -7077,7 +7079,7 @@
             }
         }
 
-        // Extraer texto de la página actual del PDF
+        // Extraer texto de la página actual del PDF preservando estructura de párrafos
         async function extractTextFromPage(pageNum) {
             if (!pdfDoc) return "";
             
@@ -7085,15 +7087,69 @@
                 const page = await pdfDoc.getPage(pageNum);
                 const textContent = await page.getTextContent();
                 
-                // Extraer y limpiar texto
-                let text = textContent.items
-                    .map(item => item.str)
-                    .join(' ');
+                if (!textContent.items || textContent.items.length === 0) return "";
                 
-                // Limpiar espacios múltiples y saltos de línea excesivos
-                text = text.replace(/\s+/g, ' ').trim();
+                // Usar coordenadas Y (transform[5]) para detectar saltos de párrafo
+                // PDF.js items tienen: { str, transform: [scaleX, skewX, skewY, scaleY, translateX, translateY] }
+                let result = '';
+                let lastY = null;
+                let lastItemEndX = 0;
                 
-                return text;
+                for (let i = 0; i < textContent.items.length; i++) {
+                    const item = textContent.items[i];
+                    const str = item.str;
+                    
+                    // Saltar items vacíos
+                    if (!str || str.trim() === '') {
+                        // Un item vacío con hasEOL indica salto de línea explícito
+                        if (item.hasEOL && lastY !== null) {
+                            result += '\n';
+                        }
+                        continue;
+                    }
+                    
+                    const currentY = item.transform ? item.transform[5] : null;
+                    const currentX = item.transform ? item.transform[4] : 0;
+                    const itemHeight = item.transform ? Math.abs(item.transform[3]) : 12;
+                    
+                    if (lastY !== null && currentY !== null) {
+                        // Calcular la diferencia vertical entre items
+                        const yDiff = Math.abs(lastY - currentY);
+                        
+                        // Si el salto en Y es mayor que 1.8x la altura del texto, es un nuevo párrafo
+                        if (yDiff > itemHeight * 1.8) {
+                            result += '\n\n';
+                        } else if (yDiff > itemHeight * 0.5) {
+                            // Salto de línea dentro del mismo párrafo
+                            // Solo agregar espacio si no termina ya en espacio
+                            if (result.length > 0 && !result.endsWith(' ') && !result.endsWith('\n')) {
+                                result += ' ';
+                            }
+                        } else {
+                            // Misma línea - verificar si necesitamos espacio entre items
+                            if (result.length > 0 && !result.endsWith(' ') && !result.endsWith('\n') && !str.startsWith(' ')) {
+                                // Estimar si hay un espacio entre el item anterior y este
+                                const gap = currentX - lastItemEndX;
+                                if (gap > itemHeight * 0.3) {
+                                    result += ' ';
+                                }
+                            }
+                        }
+                    }
+                    
+                    result += str;
+                    lastY = currentY;
+                    // Estimar posición X final del item actual
+                    lastItemEndX = currentX + (item.width || str.length * itemHeight * 0.5);
+                }
+                
+                // Limpiar: colapsar 3+ saltos de línea en 2, y espacios múltiples en 1
+                result = result
+                    .replace(/ {2,}/g, ' ')           // Espacios múltiples → 1
+                    .replace(/\n{3,}/g, '\n\n')        // 3+ saltos → 2 (párrafo)
+                    .replace(/^\s+|\s+$/g, '');         // Trim total
+                
+                return result;
             } catch (error) {
                 console.error('Error extrayendo texto:', error);
                 return "";
@@ -7101,34 +7157,53 @@
         }
 
         // Iniciar TTS
-        async function startTTS() {
+        // forceNewPage: true fuerza extracción de texto incluso si hay cola pendiente
+        async function startTTS(forceNewPage = false) {
             if (!pdfDoc) return;
             
             // Activar sistema de audio en segundo plano
             enableBackgroundAudio();
             
-            // Si ya está reproduciendo, solo continuar
-            if (ttsIsPlaying && ttsSynthesis.paused) {
+            // Si ya está reproduciendo y está pausado, solo reanudar
+            if (ttsIsPlaying && ttsSynthesis.paused && !forceNewPage) {
                 ttsSynthesis.resume();
                 updateTTSPlayButton(true);
                 updateTTSStatus('Reproduciendo...');
                 return;
             }
             
-            // Si ya hay una cola y no terminamos, continuar desde donde íbamos
-            if (ttsTextQueue.length > 0 && ttsCurrentQueueIndex < ttsTextQueue.length) {
+            // Si hay cola pendiente Y NO estamos forzando nueva página, continuar
+            if (!forceNewPage && ttsTextQueue.length > 0 && ttsCurrentQueueIndex < ttsTextQueue.length) {
                 ttsIsPlaying = true;
                 updateTTSPlayButton(true);
                 speakNextChunk();
                 return;
             }
             
-            // Nueva página - extraer texto
+            // Nueva página - resetear cola ANTES de extraer
+            ttsTextQueue = [];
+            ttsCurrentQueueIndex = 0;
+            
+            // ID único para esta operación (previene race conditions)
+            const thisPageId = ++ttsCurrentPageId;
+            
+            // Extraer texto
             updateTTSStatus('Extrayendo texto...');
             const text = await extractTextFromPage(ttsCurrentPage);
             
+            // Verificar que no haya habido otra operación mientras esperábamos
+            if (thisPageId !== ttsCurrentPageId) return;
+            
             if (!text || text.length < 10) {
                 updateTTSStatus('Página sin texto suficiente');
+                // Intentar la siguiente página automáticamente
+                if (ttsIsPlaying && ttsCurrentPage < pdfDoc.numPages) {
+                    ttsCurrentPage++;
+                    pageNum = ttsCurrentPage;
+                    renderPage(pageNum);
+                    updateAudioFocusIndicator();
+                    setTimeout(() => { if (ttsIsPlaying) startTTS(true); }, 300);
+                }
                 return;
             }
             
@@ -7152,63 +7227,141 @@
             speakNextChunk();
         }
 
-        // Dividir texto en chunks por oraciones
+        // Dividir texto en chunks por párrafos y oraciones (mejorado para TTS)
         function splitTextIntoChunks(text) {
-            // Dividir por oraciones (puntos, signos de exclamación, interrogación seguidos de espacio o fin)
-            const sentences = text.match(/[^.!?]+[.!?]+(\s|$)/g) || [text];
+            const MAX_CHUNK_LENGTH = 200; // Máximo seguro para Chrome TTS (~15s de audio)
+            const TARGET_CHUNK_LENGTH = 150; // Tamaño ideal por chunk
+            
+            // Abreviaturas comunes que NO deben partir oraciones
+            const ABBREVIATIONS = /(?:Sr|Sra|Dr|Dra|Prof|Ing|Lic|Jr|vs|etc|vol|cap|pág|fig|aprox|tel|dept|Ud|Uds|St|Mr|Mrs|Ms|Inc|Ltd|Corp|Jr|Sr|Ph\.D)\./gi;
+            
+            // PASO 1: Dividir por párrafos (detectados por \n\n en extractTextFromPage)
+            const paragraphs = text.split(/\n\n+/).filter(p => p.trim().length > 0);
             
             const chunks = [];
-            let currentChunk = "";
             
-            sentences.forEach(sentence => {
-                // Limpiar la oración
-                const cleanSentence = sentence.trim();
-                if (!cleanSentence) return;
+            paragraphs.forEach(paragraph => {
+                // Limpiar el párrafo (colapsar saltos de línea simples en espacios)
+                let cleanPara = paragraph.replace(/\n/g, ' ').replace(/\s+/g, ' ').trim();
+                if (!cleanPara) return;
                 
-                // Si la oración es muy larga (>150 chars), dividirla en partes
-                if (cleanSentence.length > 150) {
-                    if (currentChunk) {
-                        chunks.push(currentChunk.trim());
-                        currentChunk = "";
-                    }
-                    
-                    // Dividir en partes de ~100 caracteres respetando palabras
-                    const words = cleanSentence.split(' ');
-                    let part = "";
-                    
-                    words.forEach(word => {
-                        if ((part + word).length > 100) {
-                            if (part) chunks.push(part.trim());
-                            part = word + " ";
-                        } else {
-                            part += word + " ";
-                        }
+                // PASO 2: Si el párrafo es corto, usarlo como chunk directamente
+                if (cleanPara.length <= MAX_CHUNK_LENGTH) {
+                    chunks.push(cleanPara);
+                    return;
+                }
+                
+                // PASO 3: Dividir párrafos largos por oraciones
+                // Proteger abreviaturas reemplazándolas temporalmente
+                let protected_text = cleanPara;
+                const abbrevPlaceholders = [];
+                let abbrevMatch;
+                const abbrevRegex = new RegExp(ABBREVIATIONS.source, 'gi');
+                while ((abbrevMatch = abbrevRegex.exec(cleanPara)) !== null) {
+                    const placeholder = `__ABBR${abbrevPlaceholders.length}__`;
+                    abbrevPlaceholders.push({ placeholder, original: abbrevMatch[0] });
+                    protected_text = protected_text.replace(abbrevMatch[0], placeholder);
+                }
+                
+                // Proteger puntos suspensivos
+                protected_text = protected_text.replace(/\.{3}/g, '__ELLIPSIS__');
+                
+                // Dividir por oraciones: punto/!/? seguido de espacio o fin de texto
+                // Incluye soporte para signos de apertura ¡¿
+                const sentenceParts = protected_text.split(/(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÑ¿¡"«]|$)/g);
+                
+                let currentChunk = '';
+                
+                sentenceParts.forEach(part => {
+                    // Restaurar abreviaturas y puntos suspensivos
+                    let sentence = part;
+                    abbrevPlaceholders.forEach(({ placeholder, original }) => {
+                        sentence = sentence.replace(placeholder, original);
                     });
+                    sentence = sentence.replace(/__ELLIPSIS__/g, '...');
+                    sentence = sentence.trim();
                     
-                    if (part.trim()) {
+                    if (!sentence) return;
+                    
+                    // Si agregar esta oración excede el máximo, guardar chunk actual
+                    if (currentChunk && (currentChunk.length + sentence.length + 1) > MAX_CHUNK_LENGTH) {
+                        chunks.push(currentChunk.trim());
+                        currentChunk = '';
+                    }
+                    
+                    // Si la oración sola excede el máximo, dividirla por comas o palabras
+                    if (sentence.length > MAX_CHUNK_LENGTH) {
                         if (currentChunk) {
-                            currentChunk += part + " ";
-                        } else {
-                            currentChunk = part;
+                            chunks.push(currentChunk.trim());
+                            currentChunk = '';
+                        }
+                        
+                        // Intentar dividir por comas, punto y coma, o dos puntos
+                        const subParts = sentence.split(/(?<=[,;:]\s)/);
+                        
+                        subParts.forEach(subPart => {
+                            if ((currentChunk + subPart).length > MAX_CHUNK_LENGTH) {
+                                if (currentChunk) chunks.push(currentChunk.trim());
+                                
+                                // Si aún es demasiado largo, dividir por palabras
+                                if (subPart.length > MAX_CHUNK_LENGTH) {
+                                    const words = subPart.split(' ');
+                                    currentChunk = '';
+                                    words.forEach(word => {
+                                        if ((currentChunk + ' ' + word).length > MAX_CHUNK_LENGTH) {
+                                            if (currentChunk) chunks.push(currentChunk.trim());
+                                            currentChunk = word + ' ';
+                                        } else {
+                                            currentChunk += word + ' ';
+                                        }
+                                    });
+                                } else {
+                                    currentChunk = subPart;
+                                }
+                            } else {
+                                currentChunk += subPart;
+                            }
+                        });
+                    } else {
+                        currentChunk += (currentChunk ? ' ' : '') + sentence;
+                        
+                        // Si alcanzó el tamaño objetivo, guardar
+                        if (currentChunk.length >= TARGET_CHUNK_LENGTH) {
+                            chunks.push(currentChunk.trim());
+                            currentChunk = '';
                         }
                     }
-                } else {
-                    currentChunk += cleanSentence + " ";
-                    
-                    // Si el chunk actual es suficientemente largo (>120), guardarlo
-                    if (currentChunk.length > 120) {
-                        chunks.push(currentChunk.trim());
-                        currentChunk = "";
-                    }
+                });
+                
+                // Guardar chunk restante del párrafo
+                if (currentChunk.trim()) {
+                    chunks.push(currentChunk.trim());
                 }
             });
             
-            // Agregar chunk restante
-            if (currentChunk.trim()) {
-                chunks.push(currentChunk.trim());
-            }
+            // PASO 4: Último filtrado - eliminar chunks vacíos y asegurar ninguno excede el máximo
+            const finalChunks = [];
+            chunks.forEach(chunk => {
+                if (!chunk || chunk.length < 2) return;
+                if (chunk.length > MAX_CHUNK_LENGTH) {
+                    // Dividir forzosamente por palabras
+                    const words = chunk.split(' ');
+                    let part = '';
+                    words.forEach(word => {
+                        if ((part + ' ' + word).length > MAX_CHUNK_LENGTH) {
+                            if (part.trim()) finalChunks.push(part.trim());
+                            part = word;
+                        } else {
+                            part += (part ? ' ' : '') + word;
+                        }
+                    });
+                    if (part.trim()) finalChunks.push(part.trim());
+                } else {
+                    finalChunks.push(chunk);
+                }
+            });
             
-            return chunks;
+            return finalChunks;
         }
 
         // Mostrar vista previa del texto con highlight
@@ -7243,8 +7396,19 @@
             }
         }
 
-        // Reproducir siguiente chunk
+        // Limpiar watchdog timer de TTS
+        function clearTTSWatchdog() {
+            if (ttsWatchdogTimer) {
+                clearTimeout(ttsWatchdogTimer);
+                ttsWatchdogTimer = null;
+            }
+        }
+
+        // Reproducir siguiente chunk (con watchdog contra Chrome TTS hang)
         function speakNextChunk() {
+            // Limpiar watchdog anterior
+            clearTTSWatchdog();
+            
             if (!ttsIsPlaying || ttsCurrentQueueIndex >= ttsTextQueue.length) {
                 // Terminó esta página
                 finishPage();
@@ -7253,6 +7417,10 @@
             
             const chunk = ttsTextQueue[ttsCurrentQueueIndex];
             ttsCurrentChunkText = chunk;
+            
+            // Cancelar cualquier utterance pendiente antes de crear una nueva
+            // Esto evita que Chrome acumule utterances en su cola interna
+            ttsSynthesis.cancel();
             
             const utterance = new SpeechSynthesisUtterance(chunk);
             
@@ -7266,8 +7434,15 @@
             utterance.pitch = 1;
             utterance.volume = 1;
             
+            // Calcular timeout estimado para este chunk
+            // Regla: ~150 caracteres por minuto a velocidad 1x, con margen de seguridad
+            const estimatedDurationMs = Math.max(5000, (chunk.length / (2.5 * ttsRate)) * 1000 + 3000);
+            let chunkStarted = false;
+            let chunkFinished = false;
+            
             // Eventos
             utterance.onstart = () => {
+                chunkStarted = true;
                 updateTTSProgress();
                 if (ttsIsAudioFocusMode) {
                     showTextPreview();
@@ -7275,50 +7450,94 @@
                 
                 // Reanudar AudioContext en cada chunk (por si se suspendió)
                 resumeAudioContext();
+                
+                // WATCHDOG: Configurar timeout para detectar Chrome TTS hang
+                // Chrome a veces deja de hablar sin llamar onend después de ~15s
+                clearTTSWatchdog();
+                ttsWatchdogTimer = setTimeout(() => {
+                    if (!chunkFinished && ttsIsPlaying && !ttsSynthesis.paused) {
+                        console.warn('[TTS Watchdog] Chunk pareció colgarse, forzando avance:', chunk.substring(0, 50) + '...');
+                        // Cancelar utterance actual y avanzar
+                        ttsSynthesis.cancel();
+                        ttsCurrentQueueIndex++;
+                        if (ttsIsPlaying) {
+                            // Pequeña pausa antes de reintentar
+                            setTimeout(() => speakNextChunk(), 200);
+                        }
+                    }
+                }, estimatedDurationMs);
             };
             
             utterance.onend = () => {
+                chunkFinished = true;
+                clearTTSWatchdog();
                 ttsCurrentQueueIndex++;
                 if (ttsIsPlaying) {
-                    speakNextChunk();
+                    // Pequeña pausa entre chunks para sonar más natural
+                    setTimeout(() => speakNextChunk(), 80);
                 }
             };
             
             utterance.onerror = (event) => {
+                chunkFinished = true;
+                clearTTSWatchdog();
                 if (event.error !== 'canceled' && event.error !== 'interrupted') {
                     console.error('Error TTS:', event.error);
-                    updateTTSStatus('Error: ' + event.error);
-                    ttsIsPlaying = false;
-                    updateTTSPlayButton(false);
+                    // En caso de error, intentar el siguiente chunk en lugar de detenerse
+                    ttsCurrentQueueIndex++;
+                    if (ttsIsPlaying && ttsCurrentQueueIndex < ttsTextQueue.length) {
+                        console.warn('[TTS] Error en chunk, intentando siguiente...');
+                        setTimeout(() => speakNextChunk(), 200);
+                    } else {
+                        updateTTSStatus('Error: ' + event.error);
+                        ttsIsPlaying = false;
+                        updateTTSPlayButton(false);
+                    }
                 }
-            };
-            
-            // Pausa entre chunks para sonar más natural
-            utterance.onpause = () => {
-                // No hacer nada especial en pausa
             };
             
             ttsCurrentUtterance = utterance;
             ttsSynthesis.speak(utterance);
+            
+            // FALLBACK: Si onstart nunca se llama (otro bug de Chrome),
+            // configurar un watchdog de inicio
+            setTimeout(() => {
+                if (!chunkStarted && !chunkFinished && ttsIsPlaying) {
+                    console.warn('[TTS Watchdog] Chunk nunca inició, forzando avance');
+                    ttsSynthesis.cancel();
+                    ttsCurrentQueueIndex++;
+                    if (ttsIsPlaying) {
+                        setTimeout(() => speakNextChunk(), 200);
+                    }
+                }
+            }, 3000);
         }
 
         // Finalizar página actual y pasar a siguiente
         function finishPage() {
+            // Limpiar watchdog
+            clearTTSWatchdog();
+            
             // Pausa antes de pasar página
             setTimeout(() => {
                 if (!ttsIsPlaying) return;
                 
-                if (ttsCurrentPage < pdfDoc.numPages) {
+                if (pdfDoc && ttsCurrentPage < pdfDoc.numPages) {
                     // Avanzar a siguiente página
                     ttsCurrentPage++;
                     pageNum = ttsCurrentPage;
                     renderPage(pageNum);
                     updateAudioFocusIndicator();
                     
+                    // CRÍTICO: Resetear cola ANTES de llamar a startTTS
+                    // Esto previene que startTTS() reutilice chunks de la página anterior
+                    ttsTextQueue = [];
+                    ttsCurrentQueueIndex = 0;
+                    
                     // Pequeña pausa antes de empezar nueva página
                     setTimeout(() => {
                         if (ttsIsPlaying) {
-                            startTTS();
+                            startTTS(true); // forceNewPage=true para forzar extracción
                         }
                     }, 800);
                 } else {
@@ -7326,6 +7545,10 @@
                     ttsIsPlaying = false;
                     updateTTSPlayButton(false);
                     updateTTSStatus('Fin del documento');
+                    
+                    // Limpiar cola
+                    ttsTextQueue = [];
+                    ttsCurrentQueueIndex = 0;
                     
                     // Ocultar vista previa de texto
                     const previewEl = document.getElementById('audio-text-preview');
@@ -7363,6 +7586,7 @@
 
         // Detener TTS completamente
         function stopTTS() {
+            clearTTSWatchdog();
             ttsSynthesis.cancel();
             ttsIsPlaying = false;
             ttsCurrentUtterance = null;
