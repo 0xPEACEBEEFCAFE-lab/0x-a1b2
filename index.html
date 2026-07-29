@@ -1285,30 +1285,104 @@
             margin-top: 4px;
         }
 
-        /* === GRID DE BÚSQUEDA === */
+        /* === LISTA DE BÚSQUEDA === */
         .books-grid {
             display: none;
-            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-            gap: 30px;
             width: 100%;
             margin-top: 20px;
-            justify-items: center;
+            box-sizing: border-box;
         }
 
         .books-grid.active {
-            display: grid;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            max-width: 800px;
+            margin-left: auto;
+            margin-right: auto;
         }
 
-        @media (max-width: 640px) {
-            .books-grid {
-                grid-template-columns: repeat(2, 1fr);
-                gap: 16px;
-            }
-            
-            .book-card {
-                width: 100%;
-                max-width: 180px;
-            }
+        .book-list-item {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            padding: 12px 16px;
+            background: var(--card);
+            border: 1px solid rgba(253, 253, 150, 0.08);
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        .book-list-item:hover {
+            background: rgba(253, 253, 150, 0.04);
+            border-color: var(--lumin-yellow-soft);
+            transform: translateX(4px);
+        }
+
+        .book-list-cover {
+            width: 44px;
+            height: 60px;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.25);
+        }
+
+        .book-list-info {
+            flex-grow: 1;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .book-list-title {
+            font-family: 'Fraunces', serif;
+            font-size: 15px;
+            font-weight: 700;
+            color: var(--foreground);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            text-align: left;
+        }
+
+        .book-list-author-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            color: var(--muted-foreground);
+        }
+
+        .book-list-author {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 180px;
+        }
+
+        .book-list-dot {
+            color: var(--muted-foreground);
+            opacity: 0.5;
+        }
+
+        .book-list-progress {
+            display: inline-flex;
+            align-items: center;
+            color: var(--muted-foreground);
+        }
+
+        .book-list-actions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-shrink: 0;
         }
 
         /* === PANEL DE PREVISUALIZACIÓN DE NOVELA === */
@@ -4861,7 +4935,7 @@
             </div>
             <div class="carousel-counter" id="carousel-counter" style="display:none;"></div>
 
-            <div id="books-grid" class="books-grid" style="display:none;"></div>
+            <div id="books-grid" class="books-grid"></div>
         
             <!-- PANEL DE GESTIÓN DE DISEÑO -->
             <div id="ui-settings-panel" class="ui-settings-panel" style="display: none;">
@@ -6410,18 +6484,71 @@
             }
         }
 
+        function createBookListItemElement(book) {
+            const parts = book.name.split(' - ');
+            let title = book.name;
+            let author = "Lumin VIP";
+            if (parts.length > 1) {
+                title = parts[0].trim();
+                author = parts[1].trim();
+            }
+
+            const colors = getBookColor(book.name);
+            
+            let progressPercent = 0;
+            if (currentUser) {
+                const progressPage = parseInt(localStorage.getItem(`lumin_progress_${currentUser.telegram}_${book.id}`)) || 0;
+                const totalPages = parseInt(localStorage.getItem(`lumin_total_${currentUser.telegram}_${book.id}`)) || 0;
+                if (totalPages > 0 && progressPage > 0) {
+                    progressPercent = Math.min(100, Math.round((progressPage / totalPages) * 100));
+                }
+            }
+
+            const item = document.createElement('div');
+            item.className = 'book-list-item';
+            item.onclick = () => openBook((book.fileId || book.id), book.name);
+
+            const statusIcon = book.isOffline 
+                ? `<i class="fas fa-check-circle" style="color: var(--lumin-yellow);" title="Disponible offline"></i>`
+                : `<i class="fas fa-cloud-download-alt" style="color: var(--muted-foreground);" title="Requiere internet para el primer acceso"></i>`;
+
+            item.innerHTML = `
+                <div class="book-list-cover" style="background: linear-gradient(135deg, ${colors.from}, ${colors.to});">
+                    <i class="fas fa-book-open" style="color: ${colors.iconColor}; font-size: 14px;"></i>
+                </div>
+                <div class="book-list-info">
+                    <div class="book-list-title">${title}</div>
+                    <div class="book-list-author-row">
+                        <span class="book-list-author">${author}</span>
+                        <span class="book-list-dot">•</span>
+                        <span class="book-list-progress">
+                            <i class="fas fa-book-reader" style="color: var(--lumin-yellow-soft); margin-right: 4px;"></i>
+                            ${progressPercent > 0 ? `${progressPercent}%` : 'Sin empezar'}
+                        </span>
+                    </div>
+                </div>
+                <div class="book-list-actions">
+                    ${statusIcon}
+                    <button class="pixel-button secondary icon-only" style="padding: 6px 10px; font-size: 12px; margin-left: 8px;">
+                        <i class="fas fa-play"></i>
+                    </button>
+                </div>
+            `;
+            return item;
+        }
+
         function renderLibrary(books) {
             const grid = document.getElementById('books-grid');
             grid.innerHTML = '';
 
             if (books.length === 0) {
-                grid.innerHTML = '<p style="text-align:center; grid-column: 1/-1; color: var(--lumin-gold-dark);">No se encontraron documentos.</p>';
+                grid.innerHTML = '<p style="text-align:center; color: var(--lumin-gold-dark);">No se encontraron documentos.</p>';
                 return;
             }
 
             books.forEach(book => {
-                const card = createBookCardElement(book);
-                grid.appendChild(card);
+                const item = createBookListItemElement(book);
+                grid.appendChild(item);
             });
             
             updateLibraryStats();
